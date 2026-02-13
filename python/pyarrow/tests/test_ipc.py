@@ -309,6 +309,8 @@ def test_open_stream_from_buffer(stream_fixture):
 @pytest.mark.parametrize('options', [
     pa.ipc.IpcReadOptions(),
     pa.ipc.IpcReadOptions(use_threads=False),
+    pa.ipc.IpcReadOptions(validation=pa.ipc.Validation.FAST),
+    pa.ipc.IpcReadOptions(validation=pa.ipc.Validation.FULL),
 ])
 def test_open_stream_options(stream_fixture, options):
     stream_fixture.write_batches()
@@ -335,6 +337,8 @@ def test_open_stream_with_wrong_options(stream_fixture):
 @pytest.mark.parametrize('options', [
     pa.ipc.IpcReadOptions(),
     pa.ipc.IpcReadOptions(use_threads=False),
+    pa.ipc.IpcReadOptions(validation=pa.ipc.Validation.FAST),
+    pa.ipc.IpcReadOptions(validation=pa.ipc.Validation.FULL),
 ])
 def test_open_file_options(file_fixture, options):
     file_fixture.write_batches()
@@ -537,6 +541,7 @@ def test_read_options():
     assert options.ensure_native_endian is True
     assert options.ensure_alignment == pa.ipc.Alignment.Any
     assert options.included_fields == []
+    assert options.validation == pa.ipc.Validation.NONE
 
     options.ensure_native_endian = False
     assert options.ensure_native_endian is False
@@ -555,14 +560,21 @@ def test_read_options():
     with pytest.raises(TypeError):
         options.included_fields = None
 
+    options.validation = pa.ipc.Validation.FAST
+    assert options.validation == pa.ipc.Validation.FAST
+    options.validation = pa.ipc.Validation.FULL
+    assert options.validation == pa.ipc.Validation.FULL
+
     options = pa.ipc.IpcReadOptions(
         use_threads=False, ensure_native_endian=False,
-        ensure_alignment=pa.ipc.Alignment.DataTypeSpecific, included_fields=[1]
+        ensure_alignment=pa.ipc.Alignment.DataTypeSpecific, included_fields=[1],
+        validation=pa.ipc.Validation.FULL,
     )
     assert options.use_threads is False
     assert options.ensure_native_endian is False
     assert options.ensure_alignment == pa.ipc.Alignment.DataTypeSpecific
     assert options.included_fields == [1]
+    assert options.validation == pa.ipc.Validation.FULL
 
 
 def test_read_options_included_fields(stream_fixture):
@@ -1366,6 +1378,8 @@ def check_ipc_options_repr(options_obj, options_args):
             value = pa.ipc.Alignment(val).name
         elif arg == "metadata_version":
             value = pa.ipc.MetadataVersion(val).name
+        elif arg == "validation":
+            value = pa.ipc.Validation(val).name
 
         assert f"{arg}={value}" in repr
 
@@ -1412,6 +1426,7 @@ def read_options_args(request):
             "ensure_alignment": pa.ipc.Alignment.Any,
             "use_threads": True,
             "included_fields": None,
+            "validation": pa.ipc.Validation.NONE,
         }
     elif request.param == "all":
         return {
@@ -1419,6 +1434,7 @@ def read_options_args(request):
             "ensure_alignment": pa.ipc.Alignment.DataTypeSpecific,
             "use_threads": False,
             "included_fields": [1, 2, 3],
+            "validation": pa.ipc.Validation.FULL,
         }
     else:
         return {}
@@ -1429,3 +1445,80 @@ def read_options_args(request):
 def test_read_options_repr(read_options_args):
     # https://github.com/apache/arrow/issues/47358
     check_ipc_options_repr(pa.ipc.IpcReadOptions, read_options_args)
+
+
+def _make_stream_buf(batch):
+    """Write a single RecordBatch to an IPC stream buffer."""
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, batch.schema) as writer:
+        writer.write_batch(batch)
+    return sink.getvalue()
+
+
+def _make_file_buf(batch):
+    """Write a single RecordBatch to an IPC file buffer."""
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_file(sink, batch.schema) as writer:
+        writer.write_batch(batch)
+    return sink.getvalue()
+
+
+@pytest.mark.parametrize('validation', [
+    pa.ipc.Validation.NONE,
+    pa.ipc.Validation.FAST,
+    pa.ipc.Validation.FULL,
+])
+def test_stream_reader_validation(validation):
+    batch = pa.record_batch(
+        [pa.array([1, 2, 3]), pa.array(["a", "b", "c"])],
+        names=["ints", "strs"],
+    )
+    buf = _make_stream_buf(batch)
+
+    options = pa.ipc.IpcReadOptions(validation=validation)
+
+    # read_all
+    reader = pa.ipc.open_stream(buf, options=options)
+    table = reader.read_all()
+    assert table.num_rows == 3
+
+    # iteration (read_next_batch)
+    reader = pa.ipc.open_stream(buf, options=options)
+    batches = list(reader)
+    assert len(batches) == 1
+    assert batches[0].num_rows == 3
+
+    # read_next_batch_with_custom_metadata
+    reader = pa.ipc.open_stream(buf, options=options)
+    results = list(reader.iter_batches_with_custom_metadata())
+    assert len(results) == 1
+    assert results[0].batch.num_rows == 3
+
+
+@pytest.mark.parametrize('validation', [
+    pa.ipc.Validation.NONE,
+    pa.ipc.Validation.FAST,
+    pa.ipc.Validation.FULL,
+])
+def test_file_reader_validation(validation):
+    batch = pa.record_batch(
+        [pa.array([1, 2, 3]), pa.array(["a", "b", "c"])],
+        names=["ints", "strs"],
+    )
+    buf = _make_file_buf(batch)
+
+    options = pa.ipc.IpcReadOptions(validation=validation)
+
+    reader = pa.ipc.open_file(buf, options=options)
+
+    # read_all
+    table = reader.read_all()
+    assert table.num_rows == 3
+
+    # get_batch
+    b = reader.get_batch(0)
+    assert b.num_rows == 3
+
+    # get_batch_with_custom_metadata
+    result = reader.get_batch_with_custom_metadata(0)
+    assert result.batch.num_rows == 3

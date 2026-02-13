@@ -24,7 +24,7 @@ import pyarrow as pa
 from pyarrow.lib import (IpcReadOptions, IpcWriteOptions, ReadStats, WriteStats,  # noqa
                          Message, MessageReader,
                          RecordBatchReader, _ReadPandasMixin,
-                         MetadataVersion, Alignment,
+                         MetadataVersion, Alignment, Validation,
                          read_message, read_record_batch, read_schema,
                          read_tensor, write_tensor,
                          get_record_batch_size, get_tensor_size)
@@ -45,6 +45,12 @@ class RecordBatchStreamReader(lib._RecordBatchStreamReader):
         If None, default values will be used.
     memory_pool : MemoryPool, default None
         If None, default memory pool is used.
+
+    Notes
+    -----
+    If ``options.validation`` is set to ``Validation.FAST`` or
+    ``Validation.FULL``, all returned RecordBatch and Table objects will be
+    automatically validated. See :class:`IpcReadOptions` for details.
     """
 
     def __init__(self, source, *, options=None, memory_pool=None):
@@ -107,6 +113,12 @@ class RecordBatchFileReader(lib._RecordBatchFileReader):
         If None, default values will be used.
     memory_pool : MemoryPool, default None
         If None, default memory pool is used.
+
+    Notes
+    -----
+    If ``options.validation`` is set to ``Validation.FAST`` or
+    ``Validation.FULL``, all returned RecordBatch and Table objects will be
+    automatically validated. See :class:`IpcReadOptions` for details.
     """
 
     def __init__(self, source, footer_offset=None, *, options=None,

@@ -68,6 +68,45 @@ cdef CAlignment _unwrap_alignment(Alignment alignment) except *:
     raise ValueError("Not an alignment: " + repr(alignment))
 
 
+cpdef enum Validation:
+    """
+    Validation level for data returned by IPC readers.
+
+    Attributes
+    ----------
+    NONE : int
+        No validation is performed (default). Zero overhead.
+    FAST : int
+        Cheap structural validation checks are run (e.g., schema
+        consistency, array lengths). Equivalent to calling
+        ``validate(full=False)`` on the returned data.
+    FULL : int
+        Thorough validation checks are run, potentially O(n) in the
+        size of the data. Validates all data values (e.g., dictionary
+        indices, list offsets). Equivalent to calling
+        ``validate(full=True)`` on the returned data.
+    """
+    NONE = 0
+    FAST = 1
+    FULL = 2
+
+
+cdef _maybe_validate(object obj, int validation):
+    """Apply validation to a RecordBatch or Table if validation is enabled.
+
+    Parameters
+    ----------
+    obj : RecordBatch or Table
+        The object to validate.
+    validation : int
+        The validation level (cast from the Validation enum).
+    """
+    if validation == <int> Validation.FAST:
+        obj.validate(full=False)
+    elif validation == <int> Validation.FULL:
+        obj.validate(full=True)
+
+
 _WriteStats = namedtuple(
     'WriteStats',
     ('num_messages', 'num_record_batches', 'num_dictionary_batches',
@@ -150,6 +189,12 @@ cdef class IpcReadOptions(_Weakrefable):
         If empty (the default), return all deserialized fields.
         If non-empty, the values are the indices of fields to read on
         the top-level schema
+    validation : Validation, default Validation.NONE
+        Level of validation to perform on RecordBatch and Table objects
+        returned by IPC readers. ``Validation.NONE`` performs no validation
+        (the default). ``Validation.FAST`` runs cheap structural checks.
+        ``Validation.FULL`` runs thorough checks that may be O(n) in the
+        size of the data.
     """
     __slots__ = ()
 
@@ -157,13 +202,15 @@ cdef class IpcReadOptions(_Weakrefable):
 
     def __init__(self, *, bint ensure_native_endian=True,
                  Alignment ensure_alignment=Alignment.Any,
-                 bint use_threads=True, list included_fields=None):
+                 bint use_threads=True, list included_fields=None,
+                 Validation validation=Validation.NONE):
         self.c_options = CIpcReadOptions.Defaults()
         self.ensure_native_endian = ensure_native_endian
         self.ensure_alignment = ensure_alignment
         self.use_threads = use_threads
         if included_fields is not None:
             self.included_fields = included_fields
+        self.validation = validation
 
     @property
     def ensure_native_endian(self):
@@ -197,14 +244,24 @@ cdef class IpcReadOptions(_Weakrefable):
     def included_fields(self, list value not None):
         self.c_options.included_fields = value
 
+    @property
+    def validation(self):
+        return Validation(self._validation)
+
+    @validation.setter
+    def validation(self, Validation value):
+        self._validation = <int> value
+
     def __repr__(self):
         alignment = Alignment(self.ensure_alignment).name
+        validation = Validation(self._validation).name
 
         return (f"<pyarrow.ipc.IpcReadOptions "
                 f"ensure_native_endian={self.ensure_native_endian} "
                 f"ensure_alignment={alignment} "
                 f"use_threads={self.use_threads} "
-                f"included_fields={self.included_fields}>")
+                f"included_fields={self.included_fields} "
+                f"validation={validation}>")
 
 
 cdef IpcReadOptions wrap_ipc_read_options(CIpcReadOptions c):
@@ -1079,6 +1136,7 @@ cdef class _RecordBatchStreamReader(RecordBatchReader):
         shared_ptr[CInputStream] in_stream
         CIpcReadOptions options
         CRecordBatchStreamReader* stream_reader
+        int _validation
 
     def __cinit__(self):
         pass
@@ -1086,12 +1144,60 @@ cdef class _RecordBatchStreamReader(RecordBatchReader):
     def _open(self, source, IpcReadOptions options=IpcReadOptions(),
               MemoryPool memory_pool=None):
         self.options = options.c_options
+        self._validation = options._validation
         self.options.memory_pool = maybe_unbox_memory_pool(memory_pool)
         _get_input_stream(source, &self.in_stream)
         with nogil:
             self.reader = GetResultValue(CRecordBatchStreamReader.Open(
                 self.in_stream, self.options))
             self.stream_reader = <CRecordBatchStreamReader*> self.reader.get()
+
+    def read_next_batch(self):
+        """
+        Read next RecordBatch from the stream.
+
+        Raises
+        ------
+        StopIteration:
+            At end of stream.
+
+        Returns
+        -------
+        RecordBatch
+        """
+        batch = super().read_next_batch()
+        _maybe_validate(batch, self._validation)
+        return batch
+
+    def read_next_batch_with_custom_metadata(self):
+        """
+        Read next RecordBatch from the stream along with its custom metadata.
+
+        Raises
+        ------
+        StopIteration:
+            At end of stream.
+
+        Returns
+        -------
+        batch : RecordBatch
+        custom_metadata : KeyValueMetadata
+        """
+        result = super().read_next_batch_with_custom_metadata()
+        _maybe_validate(result.batch, self._validation)
+        return result
+
+    def read_all(self):
+        """
+        Read all record batches as a pyarrow.Table.
+
+        Returns
+        -------
+        Table
+        """
+        table = super().read_all()
+        _maybe_validate(table, self._validation)
+        return table
 
     @property
     def stats(self):
@@ -1149,6 +1255,7 @@ cdef class _RecordBatchFileReader(_Weakrefable):
         SharedPtrNoGIL[CRecordBatchFileReader] reader
         shared_ptr[CRandomAccessFile] file
         CIpcReadOptions options
+        int _validation
 
     cdef readonly:
         Schema schema
@@ -1160,6 +1267,7 @@ cdef class _RecordBatchFileReader(_Weakrefable):
               IpcReadOptions options=IpcReadOptions(),
               MemoryPool memory_pool=None):
         self.options = options.c_options
+        self._validation = options._validation
         self.options.memory_pool = maybe_unbox_memory_pool(memory_pool)
         try:
             source = as_buffer(source)
@@ -1213,7 +1321,9 @@ cdef class _RecordBatchFileReader(_Weakrefable):
         with nogil:
             batch = GetResultValue(self.reader.get().ReadRecordBatch(i))
 
-        return pyarrow_wrap_batch(batch)
+        result = pyarrow_wrap_batch(batch)
+        _maybe_validate(result, self._validation)
+        return result
 
     # TODO(wesm): ARROW-503: Function was renamed. Remove after a period of
     # time has passed
@@ -1244,7 +1354,9 @@ cdef class _RecordBatchFileReader(_Weakrefable):
             batch_with_metadata = GetResultValue(
                 self.reader.get().ReadRecordBatchWithCustomMetadata(i))
 
-        return _wrap_record_batch_with_metadata(batch_with_metadata)
+        result = _wrap_record_batch_with_metadata(batch_with_metadata)
+        _maybe_validate(result.batch, self._validation)
+        return result
 
     def read_all(self):
         """
@@ -1265,7 +1377,9 @@ cdef class _RecordBatchFileReader(_Weakrefable):
             table = GetResultValue(
                 CTable.FromRecordBatches(self.schema.sp_schema, move(batches)))
 
-        return pyarrow_wrap_table(table)
+        result = pyarrow_wrap_table(table)
+        _maybe_validate(result, self._validation)
+        return result
 
     read_pandas = _ReadPandasMixin.read_pandas
 

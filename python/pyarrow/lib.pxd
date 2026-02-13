@@ -49,6 +49,7 @@ cdef IpcWriteOptions wrap_ipc_write_options(CIpcWriteOptions c)
 cdef class IpcReadOptions(_Weakrefable):
     cdef:
         CIpcReadOptions c_options
+        int _validation
 
 
 cdef IpcReadOptions wrap_ipc_read_options(CIpcReadOptions c)
